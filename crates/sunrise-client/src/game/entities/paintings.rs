@@ -500,14 +500,11 @@ impl Game<'_> {
                         living: None,
                         tnt_fuse: None,
                         orb_value: None,
-                        painting: Some(
-                            mod_api::__private::built::PaintingRenderState {
-                                facing,
-                                width: p.width,
-                                height: p.height,
-                            }
-                            .into(),
-                        ),
+                        painting: Some(mod_api::__private::built::PaintingRenderState {
+                            facing,
+                            width: p.width,
+                            height: p.height,
+                        }),
                     }
                     .into();
                 let light = self.world.light(p.pos[0], p.pos[1], p.pos[2]);
