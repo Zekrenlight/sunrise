@@ -23,6 +23,7 @@ use std::{
 use sunrise_assets::resource_source::{Resource, ResourceSource};
 use sunrise_core::random::{LegacyRandom, RandomSource};
 
+mod binaural;
 mod fx;
 mod reverb;
 
@@ -56,6 +57,8 @@ struct Channel {
     unmuffled: bool,
     /// Its own effects (`SoundPlay::effects`) and their filters' state.
     fx: fx::VoiceFx,
+    /// Its two ears' state while Directional Audio renders it.
+    binaural: binaural::Binaural,
 }
 /// The cutoff of the muffle's low-pass at full strength: the world heard through ringing ears.
 const MUFFLED_CUTOFF: f32 = 300.0;
@@ -193,8 +196,12 @@ struct Mixer {
     world_names: Vec<String>,
     /// The callback's cameras (position, basis, world), kept to be refilled without allocating.
     cameras: Vec<([f64; 3], Basis, u32)>,
-    /// Per-source gain/pan/step cache for one buffer, reused across callbacks.
-    voices: Vec<(ChannelId, [f32; 3], f64)>,
+    /// Per-source gain/pan/step cache for one buffer, reused across callbacks, with the
+    /// direction (listener space) of a source Directional Audio renders.
+    voices: Vec<(ChannelId, [f32; 3], f64, Option<[f32; 3]>)>,
+    /// Directional Audio (`directionalAudio`): positioned mono sounds are rendered for two
+    /// ears ([`binaural`]) on a stereo output heard from one camera.
+    directional: bool,
     /// Mods' audio streams (`ClientHost::open_audio_stream`).
     streams: Vec<streams::StreamVoice>,
     /// Each `SoundSource`'s volume for a stream: master times the group, as every sound's.
@@ -483,6 +490,8 @@ pub struct Audio {
     entities_stale: std::sync::atomic::AtomicBool,
     /// The `stream_gain` the mixer was last given: it is locked again only when this changes.
     stream_gain_sent: [f32; 11],
+    /// The `directionalAudio` option as last set; none before the first.
+    directional: Option<bool>,
     /// `SoundEngine.lastSeenDevices`: the system default output last seen.
     #[cfg(feature = "audio")]
     default_seen: Option<String>,
@@ -680,6 +689,7 @@ impl Backend for MixerBackend {
                 started: None,
                 unmuffled: false,
                 fx: fx::VoiceFx::default(),
+                binaural: binaural::Binaural::default(),
             },
         );
         Some(id)
@@ -867,15 +877,24 @@ fn distance_gain(linear: Option<f32>, distance: f32) -> f32 {
         Some(_) => 0.0,
     }
 }
+/// How a voice's direct sound reaches the output.
+#[derive(Clone, Copy, Debug)]
+enum Pan {
+    /// The stereo panner's `[left, right, gain]` (gain alone on a mono output).
+    Gains([f32; 3]),
+    /// Directional Audio's two ears, for a mono source in direction `toward` (listener space)
+    /// at `gain`, on a stereo output.
+    Binaural { toward: [f32; 3], gain: f32 },
+}
 /// One voice's buffer through its effects ([`fx::VoiceFx`]): read as the plain path reads it
 /// (linear interpolation, looping or stopping at the end), its direct sound filtered and panned
-/// by `[left, right, gain]` into `out`, and its sends, at the sound's distance gain, into the
-/// shared reverbs' input.
+/// by `pan` into `out`, and its sends, at the sound's distance gain, into the shared reverbs'
+/// input.
 #[cfg_attr(not(feature = "audio"), allow(dead_code))]
 fn mix_with_effects(
     c: &mut Channel,
     (samples, source_channels, frames, step): (&[f32], usize, usize, f64),
-    [left, right, gain]: [f32; 3],
+    pan: Pan,
     out: &mut [f32],
     channels: usize,
     rate: u32,
@@ -883,6 +902,13 @@ fn mix_with_effects(
 ) {
     let buffer_frames = out.len() / channels;
     let stereo = source_channels > 1;
+    let (mut ears, [left, right, gain]) = match pan {
+        Pan::Gains(gains) => (None, gains),
+        Pan::Binaural { toward, gain } => (
+            Some(c.binaural.begin(toward, gain, buffer_frames, rate)),
+            [0.0, 0.0, gain],
+        ),
+    };
     let mut glide = c.fx.begin(buffer_frames, rate);
     let mut input: &mut [f32] = &mut [];
     if glide.sends {
@@ -913,7 +939,11 @@ fn mix_with_effects(
         };
         let send = c.fx.frame(&mut glide, &mut x, stereo);
         let [l, r] = if stereo { x } else { [x[0], x[0]] };
-        if channels >= 2 {
+        if let Some(ears) = ears.as_mut() {
+            let [l, r] = c.binaural.frame(ears, x[0]);
+            frame[0] += l;
+            frame[1] += r;
+        } else if channels >= 2 {
             frame[0] += l * left;
             frame[1] += r * right;
         } else {
@@ -982,6 +1012,8 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
         }),
     );
     let shared = mixer.cameras.len() > 1;
+    // Two ears need two speakers and one head.
+    let binaural = mixer.directional && channels >= 2 && !shared;
     let dot = |a: [f64; 3], b: [f64; 3]| (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) as f32;
     // Gains and pans per source for this buffer.
     let mut voices = std::mem::take(&mut mixer.voices);
@@ -1026,11 +1058,11 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
         let d = if c.relative { at } else { away(listener) };
         let d_sqr = length_sq(d);
 
-        let (gain, [left, right]) = if camera.is_none() {
-            (0.0, [0.0, 0.0])
+        let (gain, [left, right], toward) = if camera.is_none() {
+            (0.0, [0.0, 0.0], None)
         } else if direct {
             let gain = c.gain.clamp(0.0, 1.0);
-            (gain, [gain, gain])
+            (gain, [gain, gain], None)
         } else {
             let mut zero = false;
             if let Some(max) = c.linear {
@@ -1040,25 +1072,32 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
                 }
             }
             if zero {
-                (0.0, [0.0, 0.0])
+                (0.0, [0.0, 0.0], None)
             } else {
                 let distance = d_sqr.sqrt() as f32;
                 let gain = c.gain.clamp(0.0, 1.0) * distance_gain(c.linear, distance);
-                let [mut left, mut right] = if c.relative {
-                    stereo_gains_with_length(d[0] as f32, d[1] as f32, -d[2] as f32, distance)
+                // The source's direction in listener space: right, up, forward.
+                let toward = if c.relative {
+                    [d[0] as f32, d[1] as f32, -d[2] as f32]
                 } else {
-                    stereo_gains_with_length(dot(d, right), dot(d, up), dot(d, forward), distance)
+                    [dot(d, right), dot(d, up), dot(d, forward)]
                 };
+                let [mut left, mut right] =
+                    stereo_gains_with_length(toward[0], toward[1], toward[2], distance);
                 if shared {
                     let middle = (left + right) * 0.5;
                     left = middle + (left - middle) * 0.5;
                     right = middle + (right - middle) * 0.5;
                 }
-                (gain, [left * gain, right * gain])
+                (
+                    gain,
+                    [left * gain, right * gain],
+                    binaural.then_some(toward),
+                )
             }
         };
         let step = f64::from(*source_rate) / f64::from(rate) * f64::from(c.pitch.max(0.0));
-        voices.push((*id, [left, right, gain], step));
+        voices.push((*id, [left, right, gain], step, toward));
     }
     // A mod's muffle: the sounds it doesn't exempt mix into a bus of their own first.
     let muffling = mixer.muffle.active();
@@ -1067,7 +1106,7 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
         bus.clear();
         bus.resize(data.len(), 0.0);
     }
-    for (id, [left, right, gain], step) in voices.iter().copied() {
+    for (id, [left, right, gain], step, toward) in voices.iter().copied() {
         let Some(c) = mixer.channels.get_mut(&id) else {
             continue;
         };
@@ -1107,6 +1146,7 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
                     c.position += step;
                 }
             }
+            c.binaural.release();
             continue;
         }
 
@@ -1115,11 +1155,18 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
         } else {
             &mut *data
         };
-        if !c.fx.bypassed() {
+        let pan = match toward {
+            Some(toward) => Pan::Binaural { toward, gain },
+            None => {
+                c.binaural.release();
+                Pan::Gains([left, right, gain])
+            }
+        };
+        if !c.fx.bypassed() || matches!(pan, Pan::Binaural { .. }) {
             mix_with_effects(
                 c,
                 (samples.as_slice(), source_channels, frames, step),
-                [left, right, gain],
+                pan,
                 out,
                 channels,
                 rate,
@@ -1545,6 +1592,7 @@ impl Audio {
             muffle: None,
             stream_gain_sent: [f32::NAN; 11],
             entities_stale: Default::default(),
+            directional: None,
             #[cfg(feature = "audio")]
             default_seen: if live { default_output_name() } else { None },
             #[cfg(feature = "audio")]
@@ -1726,6 +1774,7 @@ impl Audio {
             muffle: None,
             stream_gain_sent: [f32::NAN; 11],
             entities_stale: Default::default(),
+            directional: None,
             // The primary backend owns and maintains the output device.
             #[cfg(feature = "audio")]
             default_seen: self.default_seen.clone(),
@@ -1992,6 +2041,25 @@ impl Audio {
     fn set_muffle_level(&mut self, level: [f32; 2]) {
         if let Ok(mut m) = self.backend.mixer.lock() {
             m.muffle.target = level;
+        }
+    }
+    /// Vanilla's `directionalAudio` option: on a stereo output, positioned sounds are rendered
+    /// for two ears from a spherical head (`binaural`), as vanilla asks OpenAL for HRTF. Off,
+    /// the stereo panner plays them as before. A change after the first setting reloads the
+    /// sound manager, as the option's own update does (`SoundManager.reload`: every sound
+    /// stops), then plays the button click it plays.
+    pub fn set_directional_audio(&mut self, on: bool) {
+        let changed = match self.directional.replace(on) {
+            Some(was) if was == on => return,
+            Some(_) => true,
+            None => false,
+        };
+        if let Ok(mut m) = self.backend.mixer.lock() {
+            m.directional = on;
+        }
+        if changed {
+            self.stop_all();
+            self.play_button_click();
         }
     }
     /// The `uiSoundReserve` extra: positional sounds leave
@@ -2759,6 +2827,7 @@ mod tests {
             started: None,
             unmuffled: false,
             fx: fx::VoiceFx::default(),
+            binaural: binaural::Binaural::default(),
         }
     }
 
@@ -3408,6 +3477,88 @@ mod tests {
             .map(|(a, b)| (b[0] - a[0]).abs().max((b[1] - a[1]).abs()))
             .fold(0.0f32, f32::max);
         assert!(jump <= largest * 1.05, "{jump} > {largest}");
+    }
+
+    #[test]
+    fn directional_audio_places_a_sound_by_ear_and_off_plays_it_as_before() {
+        // A tone 3 blocks to the listener's right (+x is left of a camera facing +z).
+        let at = [-3.0, 0.0, 0.0];
+        let heard = |directional: bool, channels: usize| {
+            let mut m = Mixer {
+                directional,
+                ..Mixer::default()
+            };
+            m.channels.insert(1, channel(sine(3000.0), None, at, true));
+            let mut out = Vec::new();
+            let mut buffer = vec![0.0; 480 * channels];
+            for _ in 0..20 {
+                mix(&mut m, &mut buffer, channels, 48_000);
+                out.extend_from_slice(&buffer);
+            }
+            out
+        };
+        let ear = |out: &[f32], e: usize| -> Vec<f32> {
+            out.iter().skip(e).step_by(2).copied().collect()
+        };
+        let on = heard(true, 2);
+        let (left, right) = (rms(&ear(&on, 0)), rms(&ear(&on, 1)));
+        // The head shadows the left ear's highs.
+        assert!(right > left * 3.0, "{left} {right}");
+        // Off, and on a mono output (two ears need two speakers), the stereo panner plays it,
+        // sample for sample.
+        let plain = heard(false, 2);
+        assert_ne!(on, plain);
+        assert_eq!(heard(true, 1), heard(false, 1));
+    }
+
+    #[test]
+    fn turning_directional_audio_off_returns_to_the_plain_mix_exactly() {
+        let mut m = Mixer {
+            directional: true,
+            ..Mixer::default()
+        };
+        m.channels
+            .insert(1, channel(sine(440.0), None, [2.0, 1.0, 1.0], true));
+        listen(&mut m, 0.1);
+        m.directional = false;
+        let mut plain = Mixer::default();
+        let mut c = channel(sine(440.0), None, [2.0, 1.0, 1.0], true);
+        c.position = m.channels[&1].position;
+        plain.channels.insert(1, c);
+        assert_eq!(listen(&mut m, 0.1), listen(&mut plain, 0.1));
+    }
+
+    #[test]
+    fn changing_directional_audio_reloads_the_sounds_as_vanilla_does() {
+        let mut audio = Audio::silent(&sunrise_assets::resource_source::ResourceSource::directory(
+            (Path::new("/nonexistent/sunrise-test-assets")).to_path_buf(),
+        ));
+        audio.engine.registry.add_file(
+            "minecraft",
+            br#"{"ui.button.click":{"sounds":["gui/button"]},"block.hum":{"sounds":["hum"]}}"#,
+            &|_, _| true,
+        );
+        audio.engine.loaded = true;
+        audio.backend.live = true;
+        audio.play("minecraft:block.hum", Some([1.0, 2.0, 3.0]), 1.0, 1.0);
+        let playing = |audio: &Audio| audio.engine.census()["events"].to_string();
+        // The options file's first value only sets it.
+        audio.set_directional_audio(false);
+        assert!(playing(&audio).contains("block.hum"));
+        assert!(!audio.backend.mixer.lock().unwrap().directional);
+        // A change stops every sound, then clicks.
+        audio.set_directional_audio(true);
+        assert!(audio.backend.mixer.lock().unwrap().directional);
+        let now = playing(&audio);
+        assert!(
+            !now.contains("block.hum") && now.contains("ui.button.click"),
+            "{now}"
+        );
+        // Setting it again as it is changes nothing.
+        audio.play("minecraft:block.hum", Some([1.0, 2.0, 3.0]), 1.0, 1.0);
+        audio.set_directional_audio(true);
+        assert!(playing(&audio).contains("block.hum"));
+        audio.stop_all();
     }
 
     #[test]
