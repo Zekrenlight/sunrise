@@ -104,18 +104,18 @@ fn main() {
         (mix_elapsed.as_micros() as f64) / (mix_iterations as f64)
     );
 
-    // 2c. The same 128 channels rendered for two ears (`directionalAudio`).
+    // 2c. The same 128 channels through OpenAL Soft's HRTF (`directionalAudio`).
     audio.set_directional_audio(true);
     let start = Instant::now();
     for _ in 0..mix_iterations {
         audio.mix_buffer(&mut buffer, 2, 48_000);
     }
-    let binaural_elapsed = start.elapsed();
+    let hrtf_elapsed = start.elapsed();
     println!(
-        "2c. mix_buffer with Directional Audio (128 active channels): {:?} for {} buffers ({:.2} µs/buffer)",
-        binaural_elapsed,
+        "2c. mix_buffer with Directional Audio, HRTF (128 active channels): {:?} for {} buffers ({:.2} µs/buffer)",
+        hrtf_elapsed,
         mix_iterations,
-        (binaural_elapsed.as_micros() as f64) / (mix_iterations as f64)
+        (hrtf_elapsed.as_micros() as f64) / (mix_iterations as f64)
     );
 
     // 2b. The same mix with every sound shaped by its own effects (`SoundPlay::effects`): a
