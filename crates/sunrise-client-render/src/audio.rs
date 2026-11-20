@@ -2044,7 +2044,8 @@ impl Audio {
         }
     }
     /// Vanilla's `directionalAudio` option: on a stereo output, positioned sounds are rendered
-    /// for two ears from a spherical head (`binaural`), as vanilla asks OpenAL for HRTF. Off,
+    /// for two ears from a spherical head (`binaural`). Vanilla asks OpenAL Soft for its HRTF
+    /// instead; the spherical-head model stands in for it and does not sound the same. Off,
     /// the stereo panner plays them as before. A change after the first setting reloads the
     /// sound manager, as the option's own update does (`SoundManager.reload`: every sound
     /// stops), then plays the button click it plays.
