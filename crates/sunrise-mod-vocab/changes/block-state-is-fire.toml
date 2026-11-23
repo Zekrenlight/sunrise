@@ -1,0 +1,2 @@
+ids = ["handle:BlockStates::is_fire"]
+why = "Mods can ask whether a block state belongs to the minecraft:fire tag without resolving the block first. A bad state answers None."

@@ -274,6 +274,12 @@ impl<'a> BlockTables<'a> {
         self.pack.assets.registry.state(state)?;
         Some(self.res.facts().get(state).solid_render)
     }
+    /// `#minecraft:fire` (`BlockTags.FIRE`). None for an unknown state or unavailable tags.
+    pub(in crate::game) fn block_state_is_fire(&self, state: BlockStateId) -> Option<bool> {
+        let name = &self.pack.assets.registry.state(state)?.name;
+        let key = mod_api::__private::block_key(name)?;
+        super::native_world_read::block_in_tag(key, "minecraft:fire")
+    }
     /// `BlockState.isRedstoneConductor` for a state alone, not a block in a level.
     pub(in crate::game) fn block_state_is_redstone_conductor(
         &self,
@@ -437,5 +443,26 @@ fn fluid_measures(id: &str, kind: Option<FluidKind>) -> FluidMeasures {
                 .map_or(id, |fluid| fluid.get().id.as_str());
             sunrise_client::mod_content::fluid_measures(source).unwrap_or_default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mod_api::{Host, HostBlockStates};
+
+    #[test]
+    #[ignore = "daily"]
+    fn is_fire_reads_the_fire_tag_and_rejects_a_bad_state() {
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            let facts = game.block_states();
+            let fire = game.block_state_id("minecraft:fire").unwrap();
+            let soul = game.block_state_id("minecraft:soul_fire").unwrap();
+            let stone = game.block_state_id("minecraft:stone").unwrap();
+            assert_eq!(facts.is_fire(fire), Some(true));
+            assert_eq!(facts.is_fire(soul), Some(true));
+            assert_eq!(facts.is_fire(stone), Some(false));
+            let invalid = mod_api::__private::block_state_from_ordinal(fire.block(), u16::MAX);
+            assert_eq!(facts.is_fire(invalid), None);
+        });
     }
 }
