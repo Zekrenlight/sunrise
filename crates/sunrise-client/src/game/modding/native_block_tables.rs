@@ -486,6 +486,14 @@ mod tests {
             assert_eq!(facts.is_fire(invalid), None);
         });
         crate::game::native_entity_refs::tests::with_game(|game| {
+            // with_game already ran resolve_parts (so BLOCK_TAGS is published)
+            // but stops short of world open. Native tag reads use the session
+            // lock to tell that the tables are ready (`finish_open_world`).
+            let dir = std::env::temp_dir().join(format!(
+                "sunrise-block-state-is-fire-{}",
+                std::process::id()
+            ));
+            game.session_lock = Some(sunrise_client::save::SessionLock::acquire(&dir).unwrap());
             assert!(game.native_tag_items().is_some());
             let facts = game.block_states();
             let fire = BlockStatesHost::block_state_id(game, "minecraft:fire").unwrap();
@@ -496,6 +504,8 @@ mod tests {
             assert_eq!(facts.is_fire(stone), Some(false));
             let invalid = mod_api::__private::block_state_from_ordinal(fire.block(), u16::MAX);
             assert_eq!(facts.is_fire(invalid), None);
+            game.session_lock = None;
+            let _ = std::fs::remove_dir_all(dir);
         });
     }
 }
